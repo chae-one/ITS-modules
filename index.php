@@ -1897,7 +1897,7 @@ table.mg-list td { border-bottom: 1px solid var(--line-soft); padding: 9px 10px;
     <div class="brand-badge"><img src="img/logo.png" alt="ITS - Information Technology Services"></div>
     <div class="brand-text">
       <h1>ITS Department</h1>
-      <p>Information Technology Services Request Portal</p>
+      <p>Information Technology Services qweqwe</p>
     </div>
   </div>
 </header>
