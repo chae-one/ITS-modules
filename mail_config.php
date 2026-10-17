@@ -4,8 +4,8 @@
 define('SMTP_HOST', 'smtp.gmail.com');       // e.g. smtp.gmail.com, smtp.office365.com
 define('SMTP_PORT', 587);                    // 587 = STARTTLS, 465 = SSL
 define('SMTP_SECURE', 'tls');                // 'tls' for 587, 'ssl' for 465
-define('SMTP_USERNAME', 'jonasagojo09@gmail.com');
-define('SMTP_PASSWORD', 'bjpf pxux tpcz wduy'); // Gmail/Office365: use an "app password", not your normal login password
+define('SMTP_USERNAME', 'calamba.its@gmail.com');
+define('SMTP_PASSWORD', 'zfhb ybft laek ijbv'); // Gmail/Office365: use an "app password", not your normal login password
 
 // ---- How the mail should appear to the recipient ----
 define('MAIL_FROM_ADDRESS', SMTP_USERNAME); // Gmail rewrites any other From address, so keep it equal to SMTP_USERNAME

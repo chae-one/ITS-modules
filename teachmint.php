@@ -2,6 +2,7 @@
 require_once 'db_config.php';
 require_once 'settings.php';
 require_once 'mailer.php';
+require_once 'teachmint_helpers.php';
 
 // ---------- Software dropdown options are loaded from the software_options table ----------
 function load_software_options($conn, $category) {
@@ -72,50 +73,6 @@ function h($value) {
 // teachmint_requests table, app_settings and activity_logs)
 // =====================================================================
 
-/** Reads an integer from app_settings; returns $default if missing/invalid. */
-function teachmint_setting_int($conn, $key, $default) {
-    $stmt = $conn->prepare("SELECT setting_value FROM app_settings WHERE setting_key = ?");
-    if (!$stmt) return $default;
-    $stmt->bind_param('s', $key);
-    $stmt->execute();
-    $row = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
-    if (!$row || !preg_match('/^\d+$/', trim((string) $row['setting_value']))) return $default;
-    return (int) $row['setting_value'];
-}
-
-/**
- * How many (non-cancelled) Teachmint requests and units are already booked
- * on $date, counting both the primary date and any additional_dates entries.
- * @return array ['requests' => int, 'units' => int]
- */
-function teachmint_day_usage($conn, $date) {
-    $out = ['requests' => 0, 'units' => 0];
-    $like = '%' . $date . '%';
-    $stmt = $conn->prepare(
-        "SELECT teachmint_units, date_needed, additional_dates
-         FROM teachmint_requests
-         WHERE is_cancelled = 0 AND (date_needed = ? OR additional_dates LIKE ?)"
-    );
-    if (!$stmt) return $out;
-    $stmt->bind_param('ss', $date, $like);
-    $stmt->execute();
-    $res = $stmt->get_result();
-    while ($r = $res->fetch_assoc()) {
-        $hits = ($r['date_needed'] === $date) ? 1 : 0;
-        $extra = json_decode($r['additional_dates'] ?? '', true);
-        if (is_array($extra)) {
-            foreach ($extra as $e) {
-                if (is_array($e) && ($e['date'] ?? '') === $date) $hits++;
-            }
-        }
-        $out['requests'] += $hits;
-        $out['units']    += $hits * (int) $r['teachmint_units'];
-    }
-    $stmt->close();
-    return $out;
-}
-
 /** Adds a "request_submitted" row to the admin Logs tab (activity_logs). */
 function teachmint_log_submission($conn, array $p, $eventType) {
     try {
@@ -158,8 +115,7 @@ function teachmint_send_new_request_mail($id, array $p, $position, $department, 
         $datesPlain[] = $line;
     }
 
-    $rows = mail_row('Reference No.', 'TMR-' . str_pad((string) $id, 5, '0', STR_PAD_LEFT))
-          . mail_row('Date Requested', $p['date_requested'])
+    $rows = mail_row('Date Requested', $p['date_requested'])
           . mail_row('Person in Charge', $p['name'])
           . mail_row('Position', $position)
           . mail_row('Department / Office', $department)
@@ -167,12 +123,11 @@ function teachmint_send_new_request_mail($id, array $p, $position, $department, 
           . mail_row('Type of Event', $eventType)
           . mail_row('Number of Participants', (string) $p['participants'])
           . mail_row('Venue / Room', $p['venue'])
-          . mail_row('Number of Teachmint Units', (string) $p['teachmint_units'])
           . mail_row_raw('Date(s) &amp; Time(s) Needed', implode('<br>', $datesHtml))
           . mail_row('Remarks', $p['remarks']);
 
     $htmlBody = mail_wrap_table(
-        'New Teachmint Setup Request - TMR-' . str_pad((string) $id, 5, '0', STR_PAD_LEFT),
+        'New Teachmint Setup Request',
         $rows,
         'A new Teachmint setup request has been submitted. Please review the details below and prepare the equipment and venue.'
     );
@@ -181,7 +136,6 @@ function teachmint_send_new_request_mail($id, array $p, $position, $department, 
         . "Person in charge: {$p['name']} ({$department})\n"
         . "Purpose / Event: {$p['purpose']} ({$eventType})\n"
         . "Venue: {$p['venue']}\n"
-        . "Units: {$p['teachmint_units']}\n"
         . "Date(s):\n  " . implode("\n  ", $datesPlain) . "\n";
 
     return send_request_notification(
@@ -369,7 +323,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $pOld['event_type'] = trim($_POST['event_type'] ?? '');
     $pOld['event_type_other'] = trim($_POST['event_type_other'] ?? '');
     $pOld['participants'] = preg_replace('/\D/', '', (string) ($_POST['participants'] ?? ''));
-    $pOld['teachmint_units'] = max(0, (int)($_POST['teachmint_units'] ?? 1));
+    $pOld['teachmint_units'] = 1; // the form no longer asks for a unit count: each request books one
     $pOld['remarks'] = trim($_POST['remarks'] ?? '');
     $pOld['consent'] = isset($_POST['consent']) ? 1 : 0;
 
@@ -1255,22 +1209,6 @@ footer.page-footer {
             <label>Venue / Room</label>
             <input type="text" name="venue" placeholder="" value="<?= h($pOld['venue']) ?>" required>
           </div>
-          <div class="field">
-            <label>Number of Teachmint Units</label>
-            <div class="qty-stepper" id="teachmintUnitsStepper" data-min="0" data-max="<?= (int) $MAX_UNITS_PER_REQUEST ?>">
-              <button type="button" class="qty-btn qty-minus" aria-label="Decrease number of Teachmint units">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-              </button>
-              <input type="number" name="teachmint_units" id="teachmint_units_input"
-                     min="0" max="<?= (int) $MAX_UNITS_PER_REQUEST ?>" step="1" inputmode="numeric"
-                     value="<?= h($pOld['teachmint_units']) ?>" required>
-              <button type="button" class="qty-btn qty-plus" aria-label="Increase number of Teachmint units">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 2v8M2 6h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-              </button>
-            </div>
-            <p class="row-limit-note">Up to <?= (int) $MAX_UNITS_PER_REQUEST ?> unit(s) per request.</p>
-          </div>
-
           <div class="field span-2" id="datesNeededField">
             <label>Date(s) &amp; Time(s) Needed</label>
             <div class="dn-entry-row">
@@ -1612,47 +1550,6 @@ footer.page-footer {
     sync();
   })();
 
-  // ---------- Number of Teachmint Units: tap +/- stepper ----------
-  (function () {
-    var wrap = document.getElementById('teachmintUnitsStepper');
-    if (!wrap) return;
-    var input = document.getElementById('teachmint_units_input');
-    var minusBtn = wrap.querySelector('.qty-minus');
-    var plusBtn = wrap.querySelector('.qty-plus');
-    var min = parseInt(wrap.getAttribute('data-min'), 10);
-    if (isNaN(min)) min = 0;
-    var max = parseInt(wrap.getAttribute('data-max'), 10) || 1;
-
-    function clamp(v) {
-      if (isNaN(v)) v = min;
-      return Math.min(max, Math.max(min, v));
-    }
-    function syncButtons() {
-      var v = parseInt(input.value, 10);
-      if (isNaN(v)) v = min;
-      minusBtn.disabled = v <= min;
-      plusBtn.disabled = v >= max;
-    }
-    function setValue(v) {
-      input.value = clamp(v);
-      syncButtons();
-    }
-    minusBtn.addEventListener('click', function () {
-      setValue((parseInt(input.value, 10) || min) - 1);
-    });
-    plusBtn.addEventListener('click', function () {
-      setValue((parseInt(input.value, 10) || min) + 1);
-    });
-    input.addEventListener('input', function () {
-      input.value = input.value.replace(/[^0-9]/g, '');
-      syncButtons();
-    });
-    input.addEventListener('blur', function () {
-      setValue(parseInt(input.value, 10));
-    });
-    syncButtons();
-  })();
-
   // ---------- Date(s) & Time(s) Needed: shared entry fields + bubbles/chips ----------
   // Mirrors TIME_SELECTION_MIN / TIME_SELECTION_MAX / DATES_NEEDED_MAX_ROWS in PHP.
   var TIME_SELECTION_MIN = <?= json_encode(TIME_SELECTION_MIN) ?>;
@@ -1946,7 +1843,6 @@ footer.page-footer {
     html += row('Type of Event', eventTypeValue());
     html += row('Number of Participants', form.elements['participants'].value);
     html += row('Venue / Room', form.elements['venue'].value);
-    html += row('Number of Units', form.elements['teachmint_units'].value);
     var dnRows = dnManager.getRows();
     if (dnRows.length) {
       var dnList = dnRows.map(function (r, idx) {
