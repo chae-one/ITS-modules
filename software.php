@@ -302,10 +302,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // ---------- Record it in the admin Logs tab (under its Date Requested) ----------
         if ($id > 0) {
-            log_new_request($conn, 'software', [
-                'name'           => $old['name'],
-                'date_requested' => $old['date_requested'],
-            ]);
+            try {
+                log_new_request($conn, 'software', [
+                    'name'           => $old['name'],
+                    'date_requested' => $old['date_requested'],
+                ]);
+            } catch (Throwable $t) {
+                error_log('software: could not write activity log - ' . $t->getMessage());
+            }
         }
 
         // ---------- Email the ITS admin inbox about this new request ----------
@@ -337,7 +341,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             . "Computer Laboratory: {$old['computer_laboratory']}\n"
             . "Licensed Software: {$licensedList}\n"
             . "Freeware: {$freewareList}\n";
-        send_request_notification('New Software Installation Request', $htmlBody, $plainBody);
+        try {
+            send_request_notification('New Software Installation Request - ' . $old['name'], $htmlBody, $plainBody);
+        } catch (Throwable $t) {
+            error_log('software: notification mail failed for request #' . $id . ' - ' . $t->getMessage());
+        }
 
         // ---------- Redirect (Post/Redirect/Get) ----------
         // Sends the browser to a plain GET request for the success screen so

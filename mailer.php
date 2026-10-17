@@ -17,33 +17,53 @@ if (file_exists($__PHPMAILER_AUTOLOAD)) {
     require_once $__PHPMAILER_AUTOLOAD;
 }
 
+// ---- "Receipt" / do-not-reply behaviour (override any of these in mail_config.php) ----
+// Replies are pointed at an address that cannot receive mail (.invalid is a
+// reserved TLD), so a reply bounces instead of landing in the sending inbox.
+if (!defined('MAIL_NOREPLY_ADDRESS')) define('MAIL_NOREPLY_ADDRESS', 'no-reply@portal.invalid');
+if (!defined('MAIL_NOREPLY_NAME'))    define('MAIL_NOREPLY_NAME', 'Do Not Reply');
+if (!defined('MAIL_RECEIPT_NOTE'))    define('MAIL_RECEIPT_NOTE', 'This is an automated receipt from the ITS Request Portal. This mailbox is not monitored - please do not reply to this email.');
+
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\SMTP;
 use PHPMailer\PHPMailer\Exception;
 
 /**
- * The inboxes a notification should go to.
+ * The inboxes a message should go to.
  *
- * Reads the active rows managed from admin.php. If the table is missing,
- * empty, or the database handle is not available (e.g. mailer.php used on
- * its own), it falls back to MAIL_ADMIN_ADDRESS from mail_config.php so
- * mail never silently goes nowhere.
+ * Reads the rows managed from admin.php:
+ *   'request'  - NEW-REQUEST emails: active inboxes that are also opted in
+ *                to new-request emails (notify_new_requests = 1).
+ *   'reminder' - event reminders: EVERY active inbox, regardless of the
+ *                new-request opt-in.
  *
+ * If there are no active rows at all (table missing/empty, or the database
+ * handle is not available, e.g. mailer.php used on its own) it falls back to
+ * MAIL_ADMIN_ADDRESS so mail never silently goes nowhere. If there ARE active
+ * inboxes but all of them opted out of new-request emails, nobody is mailed -
+ * that is what opting out means.
+ *
+ * @param string $audience 'request' | 'reminder'
  * @return array[] [['email' => ..., 'name' => ...], ...]
  */
-function mail_recipient_list() {
+function mail_recipient_list($audience = 'request') {
     global $conn;
 
     $list = [];
+    $haveActive = false;
     if (isset($conn) && $conn instanceof mysqli && function_exists('get_mail_recipients')) {
         foreach (get_mail_recipients($conn, true) as $row) {
+            $haveActive = true;
+            if ($audience === 'request' && isset($row['notify_new_requests']) && (int) $row['notify_new_requests'] !== 1) {
+                continue; // opted out of new-request emails
+            }
             if (filter_var($row['email'], FILTER_VALIDATE_EMAIL)) {
                 $list[] = ['email' => $row['email'], 'name' => $row['name'] ?? ''];
             }
         }
     }
 
-    if (empty($list)) {
+    if (empty($list) && !$haveActive) {
         $list[] = ['email' => MAIL_ADMIN_ADDRESS, 'name' => MAIL_ADMIN_NAME];
     }
     return $list;
@@ -60,16 +80,18 @@ function mail_recipient_list() {
  * @return bool             true if the mail was sent, false otherwise.
  */
 function send_request_notification($subject, $htmlBody, $plainBody) {
-    // Every notification and reminder ends with a "View in Calendar" button
-    // that opens the Request Calendar section of index.php.
-    $calendarUrl = mail_calendar_url();
-    if ($calendarUrl !== '') {
-        $htmlBody  .= mail_calendar_button($calendarUrl);
-        $plainBody .= "\nView in Calendar: " . $calendarUrl . "\n";
-    }
+    return mail_send_to_audience('request', $subject, $htmlBody, $plainBody);
+}
 
+/**
+ * Shared sender behind send_request_notification() (new requests) and
+ * send_request_reminder() (event reminders). Same "never throws" guarantee.
+ *
+ * @param string $audience 'request' | 'reminder' - see mail_recipient_list().
+ */
+function mail_send_to_audience($audience, $subject, $htmlBody, $plainBody) {
     if (!class_exists('PHPMailer\\PHPMailer\\PHPMailer')) {
-        error_log('send_request_notification: PHPMailer is not installed. Run "composer require phpmailer/phpmailer" in the project folder.');
+        error_log('mail_send_to_audience: PHPMailer is not installed. Run "composer require phpmailer/phpmailer" in the project folder.');
         return false;
     }
 
@@ -86,10 +108,17 @@ function send_request_notification($subject, $htmlBody, $plainBody) {
 
         $mail->setFrom(MAIL_FROM_ADDRESS, MAIL_FROM_NAME);
 
+        // Receipt-style, no-reply message: replies go to an address that
+        // cannot receive mail, and auto-responders / out-of-office bots are
+        // told to leave it alone.
+        $mail->addReplyTo(MAIL_NOREPLY_ADDRESS, MAIL_NOREPLY_NAME);
+        $mail->addCustomHeader('Auto-Submitted', 'auto-generated');
+        $mail->addCustomHeader('X-Auto-Response-Suppress', 'All');
+
         // One message, everyone on the managed list as a recipient. A bad
         // row is skipped rather than aborting the whole send.
         $added = 0;
-        foreach (mail_recipient_list() as $rcpt) {
+        foreach (mail_recipient_list($audience) as $rcpt) {
             try {
                 $mail->addAddress($rcpt['email'], $rcpt['name']);
                 $added++;
@@ -98,14 +127,20 @@ function send_request_notification($subject, $htmlBody, $plainBody) {
             }
         }
         if ($added === 0) {
-            error_log('send_request_notification: no valid recipients configured.');
+            // Nothing to send to: either no valid addresses, or (for new
+            // requests) every active inbox has opted out. Not an error.
+            if ($audience === 'request') {
+                error_log('send_request_notification: no recipients opted in to new-request emails - nothing sent.');
+            } else {
+                error_log('send_request_reminder: no valid active recipients configured.');
+            }
             return false;
         }
 
         $mail->isHTML(true);
         $mail->Subject = $subject;
         $mail->Body    = $htmlBody;
-        $mail->AltBody = $plainBody;
+        $mail->AltBody = rtrim($plainBody) . "\n\n-- \n" . MAIL_RECEIPT_NOTE . "\n";
 
         $mail->send();
         return true;
@@ -116,7 +151,7 @@ function send_request_notification($subject, $htmlBody, $plainBody) {
 }
 
 /**
- * Send the fixed ITS admin inbox a reminder that a scheduled event/request
+ * Send every ACTIVE ITS inbox a reminder that a scheduled event/request
  * is starting soon. Uses the same transport and "never throws" guarantee
  * as send_request_notification().
  *
@@ -126,32 +161,9 @@ function send_request_notification($subject, $htmlBody, $plainBody) {
  * @return bool             true if the mail was sent, false otherwise.
  */
 function send_request_reminder($subject, $htmlBody, $plainBody) {
-    // Reminders go out through the exact same mailbox/transport as the
-    // original "new request" notification, so we simply delegate to it.
-    return send_request_notification($subject, $htmlBody, $plainBody);
-}
-
-/**
- * Link to the Request Calendar section of index.php, built from
- * MAIL_PORTAL_URL in mail_config.php. Returns '' when it isn't set.
- */
-function mail_calendar_url() {
-    $base = defined('MAIL_PORTAL_URL') ? trim(MAIL_PORTAL_URL) : '';
-    return $base === '' ? '' : $base . '?tab=calendar#manage';
-}
-
-/**
- * The "View in Calendar" button, as email-safe HTML (table + inline styles so
- * it renders in Gmail/Outlook), centred under the details table.
- */
-function mail_calendar_button($url) {
-    $href = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
-    return '<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px 0;text-align:center;">'
-        . '<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"><tr>'
-        . '<td align="center" bgcolor="#2b4a9e" style="border-radius:6px;">'
-        . '<a href="' . $href . '" target="_blank" style="display:inline-block;padding:12px 26px;font-family:Segoe UI,Arial,sans-serif;font-size:14px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;">View in Calendar &rarr;</a>'
-        . '</td></tr></table>'
-        . '</div>';
+    // Same mailbox/transport as the "new request" notification, but sent to
+    // EVERY active inbox - the new-request opt-in toggle does not apply here.
+    return mail_send_to_audience('reminder', $subject, $htmlBody, $plainBody);
 }
 
 /**
@@ -216,5 +228,8 @@ function mail_wrap_table($title, $rowsHtml, $intro = '') {
         . '<table style="width:100%;border-collapse:collapse;background:#ffffff;border:1px solid #DDE2EF;border-top:none;">'
         . $rowsHtml
         . '</table>'
+        . '<p style="margin:0;padding:12px 18px;font-size:12px;color:#5B6072;line-height:1.5;background:#F4F6FB;border:1px solid #DDE2EF;border-top:none;border-radius:0 0 4px 4px;">'
+        . htmlspecialchars(MAIL_RECEIPT_NOTE, ENT_QUOTES, 'UTF-8')
+        . '</p>'
         . '</div>';
 }

@@ -3,7 +3,7 @@
 $DB_HOST = 'localhost';
 $DB_USER = 'root';
 $DB_PASS = '';
-$DB_NAME = 'sample';
+$DB_NAME = 'request_db';
 
 $conn = new mysqli(
     $DB_HOST,

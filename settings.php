@@ -11,6 +11,8 @@
 // the site keeps working until the SQL is run.
 // =====================================================================
 
+require_once __DIR__ . '/pdf_generator.php'; // dependency-free PDF writer, used by the monthly activity log export below
+
 /**
  * Built-in fallbacks. Anything missing from `app_settings` uses these.
  */
@@ -159,6 +161,7 @@ function event_type_palette() {
         'Event'                => '#be185d', // pink
         'MANCOM Meeting'       => '#1e293b', // dark slate
         'Training'             => '#a16207', // dark gold
+        'Teachmint'            => '#0e7490', // teal
         EVENT_TYPE_OTHER_VALUE => '#6b7280', // grey
     ];
 }
@@ -546,12 +549,42 @@ function log_new_request($conn, $type, array $row) {
  * @return array Rows with created_at/action/event_type/requested_by/summary,
  *               plus 'details' already decoded to an array (empty when none was stored).
  */
-function get_activity_logs($conn, $limit = 200) {
+function get_activity_logs($conn, $limit = 200, $from = null, $to = null) {
     if (!ensure_activity_log_table($conn)) return [];
     $table = activity_log_table();
     $limit = max(1, min(1000, (int) $limit));
-    $res = @$conn->query("SELECT * FROM `$table` ORDER BY id DESC LIMIT $limit");
+
+    // Optional inclusive date range, as 'YYYY-MM-DD' strings. Either end may
+    // be omitted (open-ended). Whole days: from = 00:00:00 that day, to = up
+    // to (not including) the start of the next day.
+    $where = [];
+    $types = '';
+    $args  = [];
+    if ($from !== null && preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) {
+        $where[] = 'created_at >= ?';
+        $types  .= 's';
+        $args[]  = $from . ' 00:00:00';
+    }
+    if ($to !== null && preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) {
+        $where[] = 'created_at < DATE_ADD(?, INTERVAL 1 DAY)';
+        $types  .= 's';
+        $args[]  = $to . ' 00:00:00';
+    }
+
+    $sql = "SELECT * FROM `$table`" . ($where ? ' WHERE ' . implode(' AND ', $where) : '') . " ORDER BY id DESC LIMIT $limit";
     $out = [];
+
+    if ($where) {
+        $stmt = $conn->prepare($sql);
+        if (!$stmt) return [];
+        $stmt->bind_param($types, ...$args);
+        $stmt->execute();
+        $res = $stmt->get_result();
+    } else {
+        $stmt = null;
+        $res = @$conn->query($sql);
+    }
+
     if ($res) {
         while ($row = $res->fetch_assoc()) {
             $row['details'] = $row['details'] ? (json_decode($row['details'], true) ?: []) : [];
@@ -559,6 +592,7 @@ function get_activity_logs($conn, $limit = 200) {
         }
         $res->free();
     }
+    if ($stmt) $stmt->close();
     return $out;
 }
 
@@ -600,14 +634,65 @@ function activity_log_action_color($action) {
 }
 
 /**
- * Active mail recipients as [['email'=>..,'name'=>..], ...].
- * Falls back to the address in mail_config.php when the table is empty
- * or missing, so notifications never silently stop going anywhere.
+ * Adds mail_recipients.notify_new_requests if it is missing (same idea as
+ * ensure_projector_event_columns() above), so the opt-in/opt-out toggle works
+ * without a manual SQL step. Existing recipients default to 1 (opted in), so
+ * nobody silently stops receiving new-request emails after the upgrade.
+ *
+ *   ALTER TABLE mail_recipients
+ *     ADD COLUMN notify_new_requests TINYINT(1) NOT NULL DEFAULT 1;
+ *
+ * @return bool true when the column exists afterwards.
  */
-function get_mail_recipients($conn, $activeOnly = true) {
+function ensure_mail_recipient_notify_column($conn) {
+    static $ok = null;
+    if ($ok !== null) return $ok;
+
+    try {
+        $res = $conn->query("SHOW COLUMNS FROM mail_recipients LIKE 'notify_new_requests'");
+        $exists = $res && $res->num_rows > 0;
+        if ($res instanceof mysqli_result) $res->free();
+        if ($exists) return $ok = true;
+
+        return $ok = (bool) $conn->query(
+            "ALTER TABLE mail_recipients ADD COLUMN notify_new_requests TINYINT(1) NOT NULL DEFAULT 1"
+        );
+    } catch (Throwable $e) {
+        error_log('ensure_mail_recipient_notify_column: ' . $e->getMessage());
+        return $ok = false; // table missing, or the DB user has no ALTER privilege
+    }
+}
+
+/**
+ * Mail recipients as [['id'=>..,'email'=>..,'name'=>..,'is_active'=>..,
+ * 'notify_new_requests'=>..], ...].
+ *
+ * Two independent switches per recipient:
+ *   - is_active            "Active": the inbox is live. Reminders (1 day /
+ *                          1 hour / 30 minutes) ALWAYS go to every active inbox.
+ *   - notify_new_requests  "New request emails": opt in/out of the email sent
+ *                          when a new request is submitted. Only matters
+ *                          for active inboxes.
+ *
+ * @param bool $activeOnly  Only is_active = 1 rows.
+ * @param bool $newRequestOptInOnly Also require notify_new_requests = 1
+ *                          (use this when sending a NEW-REQUEST email;
+ *                          leave false for reminders and for the admin list).
+ */
+function get_mail_recipients($conn, $activeOnly = true, $newRequestOptInOnly = false) {
     $list = [];
-    $sql  = "SELECT id, email, name, is_active FROM mail_recipients";
-    if ($activeOnly) $sql .= " WHERE is_active = 1";
+    $hasNotify = ensure_mail_recipient_notify_column($conn);
+
+    $cols = $hasNotify
+        ? "id, email, name, is_active, notify_new_requests"
+        : "id, email, name, is_active, 1 AS notify_new_requests"; // column unavailable: treat everyone as opted in
+
+    $where = [];
+    if ($activeOnly) $where[] = "is_active = 1";
+    if ($newRequestOptInOnly && $hasNotify) $where[] = "notify_new_requests = 1";
+
+    $sql = "SELECT $cols FROM mail_recipients";
+    if ($where) $sql .= " WHERE " . implode(' AND ', $where);
     $sql .= " ORDER BY id ASC";
 
     $res = @$conn->query($sql);
@@ -616,4 +701,343 @@ function get_mail_recipients($conn, $activeOnly = true) {
         $res->free();
     }
     return $list;
+}
+
+/**
+ * Opt a recipient in or out of NEW-REQUEST emails. Does not touch is_active,
+ * and reminders ignore this flag entirely.
+ *
+ * @return bool true when the row was updated.
+ */
+function set_mail_recipient_notify($conn, $id, $optedIn) {
+    if (!ensure_mail_recipient_notify_column($conn)) return false;
+
+    $stmt = $conn->prepare("UPDATE mail_recipients SET notify_new_requests = ? WHERE id = ?");
+    if (!$stmt) {
+        error_log('set_mail_recipient_notify: prepare failed - ' . $conn->error);
+        return false;
+    }
+    $val = $optedIn ? 1 : 0;
+    $id  = (int) $id;
+    $stmt->bind_param('ii', $val, $id);
+    $ok = $stmt->execute();
+    $stmt->close();
+    return $ok;
+}
+
+// ---------------------------------------------------------------------
+// MONTHLY ACTIVITY LOG ARCHIVING
+//
+// The Logs tab only ever needs to show the current month's traffic, so
+// once a calendar month has ended its activity_logs rows are exported to
+// a PDF and removed from the table - otherwise it would grow forever.
+// The PDF stays downloadable afterwards (see export_activity_log_month_pdf()),
+// so nothing is actually lost, it just moves from "a live table row" to
+// "a line in that month's PDF".
+//
+// This runs two ways, both calling run_monthly_activity_log_archive():
+//   1. Automatically, once per page load of index.php - so an admin simply
+//      opening the dashboard on or after the 1st triggers it.
+//   2. Via a plain URL a real cron job can hit without anyone opening the
+//      dashboard: index.php?cron=archive_logs (see the top of index.php).
+//      This is the reliable way to guarantee it runs even if nobody logs
+//      in that day - add it to crontab if you want that guarantee.
+// Either way it only ever touches months BEFORE the current one, so
+// today's activity always stays visible and live in the Logs tab.
+// ---------------------------------------------------------------------
+
+/** Name of the table that tracks which months have already been archived. */
+function activity_log_archive_table() {
+    return 'activity_log_archives';
+}
+
+/** Creates the activity_log_archives table if it doesn't exist yet. Cached per request. */
+function ensure_activity_log_archive_table($conn) {
+    static $ok = null;
+    if ($ok !== null) return $ok;
+
+    $table = activity_log_archive_table();
+    try {
+        $sql = "CREATE TABLE IF NOT EXISTS `$table` (
+                    id         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    ym         CHAR(7) NOT NULL,
+                    filename   VARCHAR(255) NOT NULL,
+                    row_count  INT UNSIGNED NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY ym (ym)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        $ok = (bool) $conn->query($sql);
+    } catch (Throwable $e) {
+        error_log('ensure_activity_log_archive_table: ' . $e->getMessage());
+        $ok = false; // e.g. the DB user has no CREATE privilege
+    }
+    return $ok;
+}
+
+/** Folder the monthly PDFs are stored in on disk, created on first use. */
+function activity_log_archive_dir() {
+    $dir = __DIR__ . '/activity_log_archives';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    return $dir;
+}
+
+/** Filename used for a given month's archived PDF, e.g. "activity-log-2026-08.pdf". */
+function activity_log_archive_filename($ym) {
+    return 'activity-log-' . preg_replace('/[^0-9\-]/', '', $ym) . '.pdf';
+}
+
+/** Human label for a 'YYYY-MM' string, e.g. "August 2026". Falls back to the raw string if malformed. */
+function activity_log_month_label($ym) {
+    $t = DateTime::createFromFormat('Y-m-d', $ym . '-01');
+    return $t ? $t->format('F Y') : $ym;
+}
+
+/** Distinct months currently sitting in the LIVE activity_logs table, newest first, with a row count each. */
+function get_activity_log_month_counts($conn) {
+    if (!ensure_activity_log_table($conn)) return [];
+    $table = activity_log_table();
+    $out = [];
+    $res = @$conn->query(
+        "SELECT DATE_FORMAT(created_at, '%Y-%m') AS ym, COUNT(*) AS c
+         FROM `$table` GROUP BY ym ORDER BY ym DESC"
+    );
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $out[] = ['ym' => $row['ym'], 'count' => (int) $row['c']];
+        }
+        $res->free();
+    }
+    return $out;
+}
+
+/** Already-archived months (PDF generated, rows cleared from the live table), newest first. */
+function list_activity_log_archives($conn) {
+    if (!ensure_activity_log_archive_table($conn)) return [];
+    $table = activity_log_archive_table();
+    $out = [];
+    $res = @$conn->query("SELECT ym, filename, row_count, created_at FROM `$table` ORDER BY ym DESC");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) $out[] = $row;
+        $res->free();
+    }
+    return $out;
+}
+
+/** One archived month's row ('ym', 'filename', 'row_count', 'created_at'), or null if that month was never archived. */
+function get_activity_log_archive($conn, $ym) {
+    if (!ensure_activity_log_archive_table($conn)) return null;
+    $table = activity_log_archive_table();
+    $stmt = $conn->prepare("SELECT ym, filename, row_count, created_at FROM `$table` WHERE ym = ? LIMIT 1");
+    if (!$stmt) return null;
+    $stmt->bind_param('s', $ym);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $row = $res ? $res->fetch_assoc() : null;
+    $stmt->close();
+    return $row ?: null;
+}
+
+/**
+ * Every log row for one calendar month ('YYYY-MM'), newest first, with no
+ * row cap - unlike get_activity_logs() this must return the whole month
+ * so the PDF export is complete.
+ */
+function get_activity_logs_for_month($conn, $ym) {
+    if (!ensure_activity_log_table($conn)) return [];
+    if (!preg_match('/^\d{4}-\d{2}$/', $ym)) return [];
+    $table = activity_log_table();
+    $stmt = $conn->prepare("SELECT * FROM `$table` WHERE DATE_FORMAT(created_at, '%Y-%m') = ? ORDER BY id DESC");
+    if (!$stmt) return [];
+    $stmt->bind_param('s', $ym);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $out = [];
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $row['details'] = $row['details'] ? (json_decode($row['details'], true) ?: []) : [];
+            $out[] = $row;
+        }
+    }
+    $stmt->close();
+    return $out;
+}
+
+/** Deletes every activity_logs row for one calendar month. Only ever called after that month's PDF is safely saved to disk. */
+function delete_activity_logs_for_month($conn, $ym) {
+    if (!ensure_activity_log_table($conn)) return false;
+    if (!preg_match('/^\d{4}-\d{2}$/', $ym)) return false;
+    $table = activity_log_table();
+    $stmt = $conn->prepare("DELETE FROM `$table` WHERE DATE_FORMAT(created_at, '%Y-%m') = ?");
+    if (!$stmt) return false;
+    $stmt->bind_param('s', $ym);
+    $ok = $stmt->execute();
+    $stmt->close();
+    return $ok;
+}
+
+// pdf_escape_text(), pdf_clip(), pdf_pad() and build_simple_pdf() - the
+// generic, dependency-free PDF writer itself - live in pdf_generator.php
+// (required at the top of this file) so they can be reused by anything
+// else in the app, not just the activity log.
+
+/**
+ * Turns a batch of activity_logs rows into the header line + word-wrapped,
+ * column-aligned body lines build_simple_pdf() prints, sized to fit within
+ * PDF_PAGE_USABLE_WIDTH_CHARS so nothing runs past the page's printable
+ * width. Long summaries wrap onto extra indented lines instead of getting
+ * cut off, and a blank line separates each entry for easier scanning.
+ *
+ * @return array{header: string, body: string[]}
+ */
+function activity_log_pdf_lines(array $logs) {
+    $colWhen = 16; $colAction = 18; $colEvent = 20; $colBy = 18;
+    $prefixWidth  = $colWhen + 1 + $colAction + 1 + $colEvent + 1 + $colBy + 1;
+    $summaryWidth = max(20, PDF_PAGE_USABLE_WIDTH_CHARS - $prefixWidth);
+    $maxSummaryLines = 6; // a pathologically long summary is clipped rather than growing the PDF without bound
+
+    $header = pdf_pad('When', $colWhen) . ' ' . pdf_pad('Action', $colAction) . ' '
+            . pdf_pad('Event', $colEvent) . ' ' . pdf_pad('Requested By', $colBy) . ' Summary';
+
+    if (!$logs) {
+        return ['header' => $header, 'body' => ['(No activity recorded this month.)']];
+    }
+
+    $indent = str_repeat(' ', $prefixWidth);
+    $body = [];
+    foreach ($logs as $log) {
+        $when    = date('Y-m-d H:i', strtotime((string) $log['created_at']));
+        $action  = activity_log_action_label($log['action']);
+        $event   = trim((string) ($log['event_type'] ?? ''));
+        $by      = trim((string) ($log['requested_by'] ?? ''));
+        $summary = trim((string) ($log['summary'] ?? ''));
+        $extra   = activity_log_detail_text($log['action'], $log['details']);
+        if ($extra !== '') $summary .= '  (' . $extra . ')';
+
+        $wrapped = pdf_wrap($summary, $summaryWidth);
+        if (!$wrapped) $wrapped = [''];
+        if (count($wrapped) > $maxSummaryLines) {
+            $wrapped = array_slice($wrapped, 0, $maxSummaryLines);
+            $wrapped[$maxSummaryLines - 1] = pdf_clip($wrapped[$maxSummaryLines - 1] . ' ...', $summaryWidth);
+        }
+
+        $body[] = pdf_pad($when, $colWhen) . ' ' . pdf_pad($action, $colAction) . ' '
+                . pdf_pad($event, $colEvent) . ' ' . pdf_pad($by, $colBy) . ' ' . array_shift($wrapped);
+        foreach ($wrapped as $cont) {
+            $body[] = $indent . $cont;
+        }
+        $body[] = ''; // blank spacer between entries
+    }
+    if ($body && end($body) === '') array_pop($body); // no trailing blank line
+
+    return ['header' => $header, 'body' => $body];
+}
+
+/** Builds one month's activity log as PDF bytes, pulled fresh from the live table. Returns ['pdf' => bytes, 'count' => int]. */
+function generate_activity_log_month_pdf($conn, $ym) {
+    $logs  = get_activity_logs_for_month($conn, $ym);
+    $title = 'ITS Request Portal - Activity Log - ' . activity_log_month_label($ym);
+    $lines = activity_log_pdf_lines($logs);
+    return ['pdf' => build_simple_pdf($title, $lines['header'], $lines['body']), 'count' => count($logs)];
+}
+
+/** Writes a month's PDF to disk and records it in activity_log_archives (insert or refresh). */
+function save_activity_log_archive($conn, $ym, $pdfBytes, $rowCount) {
+    if (!ensure_activity_log_archive_table($conn)) return false;
+
+    $filename = activity_log_archive_filename($ym);
+    $path = activity_log_archive_dir() . '/' . $filename;
+    if (@file_put_contents($path, $pdfBytes) === false) {
+        error_log("save_activity_log_archive: could not write $path");
+        return false;
+    }
+
+    $table = activity_log_archive_table();
+    $stmt = $conn->prepare(
+        "INSERT INTO `$table` (ym, filename, row_count, created_at) VALUES (?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE filename = VALUES(filename), row_count = VALUES(row_count), created_at = NOW()"
+    );
+    if (!$stmt) return false;
+    $stmt->bind_param('ssi', $ym, $filename, $rowCount);
+    $ok = $stmt->execute();
+    $stmt->close();
+    return $ok;
+}
+
+/**
+ * Archives and clears every PAST calendar month still sitting in the live
+ * activity_logs table (every month strictly before the current one). Safe
+ * to call on every page load or as often as a cron job likes - it is a
+ * no-op once a month is already archived, and it never touches the current
+ * month, so today's activity always stays visible in the Logs tab.
+ *
+ * @return string[] The 'YYYY-MM' months that were freshly archived by this
+ *                   call (empty on a normal call) - used to fire the
+ *                   one-time automatic download in the browser.
+ */
+function run_monthly_activity_log_archive($conn) {
+    $freshlyArchived = [];
+    try {
+        if (!ensure_activity_log_table($conn) || !ensure_activity_log_archive_table($conn)) {
+            return $freshlyArchived;
+        }
+
+        $currentYm = date('Y-m');
+        foreach (get_activity_log_month_counts($conn) as $row) {
+            $ym = $row['ym'];
+            if ($ym >= $currentYm) continue; // the in-progress month is never archived
+
+            $existing = get_activity_log_archive($conn, $ym);
+            if ($existing && (int) $existing['row_count'] >= $row['count']) {
+                // Already archived with at least this many rows - just clear any stragglers left behind.
+                delete_activity_logs_for_month($conn, $ym);
+                continue;
+            }
+
+            $built = generate_activity_log_month_pdf($conn, $ym);
+            if (!save_activity_log_archive($conn, $ym, $built['pdf'], $built['count'])) {
+                continue; // couldn't save - leave the rows in place and try again next run
+            }
+            if (delete_activity_logs_for_month($conn, $ym)) {
+                $freshlyArchived[] = $ym;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('run_monthly_activity_log_archive: ' . $e->getMessage());
+    }
+    return $freshlyArchived;
+}
+
+/**
+ * Streams one month's activity log as a downloadable PDF and exits.
+ * Serves the saved archive file when that month has already been
+ * archived; otherwise builds it fresh from the live table, so the
+ * current (not-yet-archived) month can be downloaded on demand too.
+ */
+function export_activity_log_month_pdf($conn, $ym) {
+    if (!preg_match('/^\d{4}-\d{2}$/', (string) $ym)) {
+        http_response_code(400);
+        echo 'Invalid month.';
+        exit;
+    }
+
+    $pdf = null;
+    $archive = get_activity_log_archive($conn, $ym);
+    if ($archive) {
+        $path = activity_log_archive_dir() . '/' . $archive['filename'];
+        if (is_file($path)) $pdf = file_get_contents($path);
+    }
+    if ($pdf === null || $pdf === false) {
+        // Not archived yet, or the file went missing - build it fresh from
+        // whatever is still in the live table (best-effort fallback).
+        $built = generate_activity_log_month_pdf($conn, $ym);
+        $pdf = $built['pdf'];
+    }
+
+    while (ob_get_level() > 0) ob_end_clean();
+    header('Content-Type: application/pdf');
+    header('Content-Disposition: attachment; filename="' . activity_log_archive_filename($ym) . '"');
+    header('Content-Length: ' . strlen($pdf));
+    echo $pdf;
+    exit;
 }

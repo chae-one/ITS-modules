@@ -63,6 +63,51 @@ function load_department_tree($conn) {
     return $strip($tree);
 }
 
+/** Builds and sends the "new projector request" email to the ITS inboxes. */
+function projector_send_new_request_mail($id, array $p, $position, $department, $eventType, array $equipment) {
+    $datesHtml = [];
+    $datesPlain = [];
+    foreach ($p['dates_needed'] as $i => $row) {
+        $line = ($i + 1) . '. ' . $row['date'] . ', '
+              . format_clock_time_for_display($row['time_from']) . ' to ' . format_clock_time_for_display($row['time_to']);
+        $datesHtml[]  = htmlspecialchars($line, ENT_QUOTES, 'UTF-8');
+        $datesPlain[] = $line;
+    }
+    $equipmentText = implode(', ', $equipment);
+
+    $rows = mail_row('Date Requested', $p['date_requested'])
+          . mail_row('Person in Charge', $p['name'])
+          . mail_row('Position', $position)
+          . mail_row('Department / Office', $department)
+          . mail_row('Purpose / Event', $p['purpose'])
+          . mail_row('Type of Event', $eventType)
+          . mail_row('Number of Participants', (string) $p['participants'])
+          . mail_row('Venue / Room', $p['venue'])
+          . mail_row('Projector Units', (string) $p['projector_units'])
+          . mail_row('Equipment Needed', $equipmentText)
+          . mail_row_raw('Date(s) & Time(s) Needed', implode('<br>', $datesHtml))
+          . mail_row('Remarks', $p['remarks']);
+
+    $htmlBody = mail_wrap_table(
+        'New LCD Projector Request',
+        $rows,
+        'A new LCD projector request has been submitted. Please review the details below and prepare the equipment and venue.'
+    );
+
+    $plainBody = "New LCD projector request\n"
+        . "Person in charge: {$p['name']} ({$department})\n"
+        . "Purpose / Event: {$p['purpose']} ({$eventType})\n"
+        . "Venue: {$p['venue']}\n"
+        . "Projector units: {$p['projector_units']}\n"
+        . "Date(s):\n  " . implode("\n  ", $datesPlain) . "\n";
+
+    return send_request_notification(
+        'New LCD Projector Request: ' . $p['purpose'],
+        $htmlBody,
+        $plainBody
+    );
+}
+
 function h($value) {
     return htmlspecialchars($value ?? '', ENT_QUOTES, 'UTF-8');
 }
@@ -457,85 +502,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Filed under the date(s) it was requested for. The Logs tab's Event
         // column shows the Purpose / Event typed on the form.
         if ($newId > 0) {
-            log_new_request($conn, 'projector', [
-                'name'            => $pOld['name'],
-                'purpose'         => $pOld['purpose'],
-                'event_type'      => $pResolvedEventType,
-                'venue'           => $pOld['venue'],
-                'date_requested'  => $pOld['date_requested'],
-                'date_needed'     => $pOld['date_needed'],
-                'time_from'       => $pOld['time_from'],
-                'time_to'         => $pOld['time_to'],
-                'projector_units' => $pOld['projector_units'],
-                'additional_dates' => $pOld['additional_dates'],
-            ]);
-        }
-
-        // ---------- Email the ITS admin inbox about this new request ----------
-        // Purpose / Event goes at the very top of the table, in bold.
-        $eventEsc = htmlspecialchars($pOld['purpose'], ENT_QUOTES, 'UTF-8');
-        $rows = mail_row_raw('Purpose / Event', '<strong>' . $eventEsc . '</strong>')
-              . mail_row('Date Requested', $pOld['date_requested'])
-              . mail_row('Name', $pOld['name'])
-              . mail_row('Position', $pResolvedPosition)
-              . mail_row('Department / Office', $pResolvedDepartment)
-              . mail_row('Venue / Room', $pOld['venue'])
-              . mail_row('Type of Event', $pResolvedEventType)
-              . mail_row('Number of Participants', (string) (int) $pOld['participants'])
-              . mail_row('Date Needed', $pOld['date_needed'])
-              . mail_row('Time', format_clock_time_for_display($pOld['time_from']) . ' to ' . format_clock_time_for_display($pOld['time_to']))
-              . mail_row('Number of Units', (string) $pOld['projector_units'])
-              . mail_row('Equipment', implode(', ', $equipmentPayload))
-              . mail_row('Remarks', $pOld['remarks']);
-
-        // Intro paragraph shown above the main details table. When the
-        // requester added extra dates, mention that they're listed in a
-        // second table further down the email.
-        // The event name is HTML-escaped and wrapped in <strong> so it stands out.
-        $introHtml = 'A new LCD projector setup request for <strong>' . $eventEsc . '</strong> has been submitted through the ITS Request Portal. Details are below.';
-        if (!empty($pOld['additional_dates'])) {
-            $introHtml .= ' This request also includes ' . count($pOld['additional_dates'])
-                . ' additional date(s), listed in the table below the main details.';
-        }
-
-        $htmlBody = '<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:0 auto 14px;">'
-            . '<p style="margin:0;padding:0;font-size:14px;color:#2b2f40;line-height:1.6;">'
-            . $introHtml
-            . '</p>'
-            . '</div>';
-        $htmlBody .= mail_wrap_table(
-            'New LCD Projector Setup Request',
-            $rows
-        );
-
-        // ---------- Additional dates get their own table ----------
-        // (rows 2+ of "dates_needed"; the first date/time is already shown
-        // above as "Date Needed" / "Time"). Previously this was crammed into
-        // a single "Additional Dates" row as a <br>-joined text blob; now
-        // each extra date gets its own row in a proper table.
-        if (!empty($pOld['additional_dates'])) {
-            $extraRows = '';
-            foreach ($pOld['additional_dates'] as $idx => $row) {
-                $timeRange = format_clock_time_for_display($row['time_from']) . ' to ' . format_clock_time_for_display($row['time_to']);
-                $extraRows .= mail_row('Date ' . ($idx + 2), $row['date'] . ' — ' . $timeRange);
+            try {
+                log_new_request($conn, 'projector', [
+                    'name'            => $pOld['name'],
+                    'purpose'         => $pOld['purpose'],
+                    'event_type'      => $pResolvedEventType,
+                    'venue'           => $pOld['venue'],
+                    'date_requested'  => $pOld['date_requested'],
+                    'date_needed'     => $pOld['date_needed'],
+                    'time_from'       => $pOld['time_from'],
+                    'time_to'         => $pOld['time_to'],
+                    'projector_units' => $pOld['projector_units'],
+                    'additional_dates' => $pOld['additional_dates'],
+                ]);
+            } catch (Throwable $t) {
+                error_log('projector: could not write activity log - ' . $t->getMessage());
             }
-            $htmlBody .= '<div style="margin-top:16px;">'
-                . mail_wrap_table('Additional Dates Requested', $extraRows)
-                . '</div>';
+
+            // ---------- Email the ITS inboxes ----------
+            // Never blocks the save: failures are logged and swallowed.
+            try {
+                projector_send_new_request_mail($newId, $pOld, $pResolvedPosition, $pResolvedDepartment, $pResolvedEventType, $equipmentPayload);
+            } catch (Throwable $t) {
+                error_log('projector: notification mail failed for request #' . $newId . ' - ' . $t->getMessage());
+            }
         }
-        $plainBody = "New LCD Projector Setup Request\n"
-            . "Event: {$pOld['purpose']}\n"
-            . "Name: {$pOld['name']}\n"
-            . "Department: {$pResolvedDepartment}\n"
-            . "Venue: {$pOld['venue']}\n"
-            . "Type of Event: {$pResolvedEventType} ({$pOld['participants']} participants)\n"
-            . "Date Needed: {$pOld['date_needed']} (" . format_clock_time_for_display($pOld['time_from']) . ' to ' . format_clock_time_for_display($pOld['time_to']) . ")\n";
-        send_request_notification('New LCD Projector Setup Request', $htmlBody, $plainBody);
 
         // ---------- Redirect (Post/Redirect/Get) ----------
         // Sends the browser to a plain GET request for the success screen so
         // that refreshing the page afterwards does not re-POST and re-submit
-        // (and re-email) the same request.
+        // the same request.
         header('Location: ' . basename(__FILE__) . '?success=1');
         exit;
     }
@@ -1221,7 +1217,7 @@ footer.page-footer {
             <label>Type of Event <i class="ev-dot" id="eventTypeDot"></i></label>
             <select name="event_type" id="event_type_select" required>
               <option value="">-- Select --</option>
-              <?php foreach (array_keys(event_type_palette()) as $opt): ?>
+              <?php foreach (array_keys(array_diff_key(event_type_palette(), ["Teachmint" => 1])) as $opt): ?>
                 <option value="<?= h($opt) ?>" <?= $pOld['event_type'] === $opt ? 'selected' : '' ?>><?= h($opt === EVENT_TYPE_OTHER_VALUE ? 'Others (please specify)' : $opt) ?></option>
               <?php endforeach; ?>
             </select>
